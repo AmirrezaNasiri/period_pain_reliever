@@ -2,58 +2,22 @@
 #include <ACS712.h>
 #include <ArduinoJson.h>
 #include <StreamUtils.h>
-#include "HeatingPad.h"
 
 #define DEBUG false
 #define BLUETOOTH_RX_PIN 2
 #define BLUETOOTH_TX_PIN 3
 #define BLUETOOTH_STATE_PIN 4
-#define BLUETOOTH_MAX_RX_PACKET 256
 #define CURRENT_SENSOR_PIN A0
 #define CURRENT_SENSOR_SENSITIVITY 66
-#define PAD_A_GATE_PIN 5
-#define PAD_A_TEMP_A_PIN A1
-#define PAD_A_TEMP_B_PIN A2
-#define PAD_B_GATE_PIN 6
-#define PAD_B_TEMP_A_PIN A3
-#define PAD_B_TEMP_B_PIN A4
-#define PAD_C_GATE_PIN 7
-#define PAD_C_TEMP_A_PIN A5
-#define PAD_C_TEMP_B_PIN A6
+#define PAD_A_PWM_PIN 9
+#define PAD_B_PWM_PIN 10
+#define PAD_C_PWM_PIN 11
 
 NeoSWSerial bluetooth(BLUETOOTH_RX_PIN, BLUETOOTH_TX_PIN);
 ACS712 current(CURRENT_SENSOR_PIN, 5.0, 1023, CURRENT_SENSOR_SENSITIVITY);
-HeatingPad padA(PAD_A_GATE_PIN, PAD_A_TEMP_A_PIN, PAD_A_TEMP_B_PIN);
-HeatingPad padB(PAD_B_GATE_PIN, PAD_B_TEMP_A_PIN, PAD_B_TEMP_B_PIN);
-HeatingPad padC(PAD_C_GATE_PIN, PAD_C_TEMP_A_PIN, PAD_C_TEMP_B_PIN);
 
 float lastCurrent;
-volatile bool hasPendingBluetoothData;
-volatile char bluetoothData[BLUETOOTH_MAX_RX_PACKET];
-volatile int bluetoothDataLen = 0;
-
-static void receiveBluetoothData(uint8_t c) {  
-  if (c == '{') {
-    for(int i = 0; i < BLUETOOTH_MAX_RX_PACKET; i++) {
-      bluetoothData[i] = 0;
-    }
-    bluetoothDataLen = 0;
-    hasPendingBluetoothData = false;
-  }
-
-  if (bluetoothDataLen == BLUETOOTH_MAX_RX_PACKET) {
-    return;
-  }
-
-  if (bluetoothDataLen <= BLUETOOTH_MAX_RX_PACKET - 2) {
-    bluetoothData[bluetoothDataLen++] = (char) c;
-  }
-  
-  if (c == '\n' || c == '\r' || c == '}' || bluetoothDataLen == BLUETOOTH_MAX_RX_PACKET - 1) {
-    hasPendingBluetoothData = true;
-    bluetoothData[bluetoothDataLen++] = 0;
-  }
-}
+int padA_Cycle, padB_Cycle, padC_Cycle = 0;
 
 void setup() {
   if (DEBUG) {
@@ -62,15 +26,18 @@ void setup() {
   }
 
   current.autoMidPoint();
+  
+  pinMode(PAD_A_PWM_PIN, OUTPUT);
+  pinMode(PAD_B_PWM_PIN, OUTPUT);
+  pinMode(PAD_C_PWM_PIN, OUTPUT);
 
-  log("[*] waiting for bluetooth connection ...");
+  log(F("[*] waiting for bluetooth connection ..."));
 
   pinMode(BLUETOOTH_STATE_PIN, INPUT);
-  bluetooth.attachInterrupt(receiveBluetoothData);
   bluetooth.begin(9600);
   while (digitalRead(BLUETOOTH_STATE_PIN) == LOW) continue;
 
-  sendSignal("ping");
+  sendSignal(F("ping"));
   sendInitialReport();
   delay(1000);
 }
@@ -79,100 +46,89 @@ void loop() {
   processIncomingCommand();
   sendPeriodicReport();
 
-  // Control heating pads
-  padA.adjustHeatingEdge();
-  padB.adjustHeatingEdge();
-  padC.adjustHeatingEdge();
+  adjustPad(PAD_A_PWM_PIN, padA_Cycle);
+  adjustPad(PAD_B_PWM_PIN, padB_Cycle);
+  adjustPad(PAD_C_PWM_PIN, padC_Cycle);
 
   delay(1000);
 }
 
 void sendInitialReport() {
-  log("[i] initial report:");
+  log(F("[i] initial report:"));
 
   beginCurrentMeasuring();
   
-  StaticJsonDocument<192> json;
+  StaticJsonDocument<96> json;
 
-  json["type"] = "initial_report";
+  json[F("_t")] = F("ir");
 
   // Calculate max current of each pad
-  padA.on();
-  json["pad_a_max_current"] = measureCurrent();
-  padA.off();
-  padB.on();
-  json["pad_b_max_current"] = measureCurrent();
-  padB.off();
-  padC.on();
-  json["pad_c_max_current"] = measureCurrent();
-  padC.off();
+  adjustPad(PAD_A_PWM_PIN, 100);
+  json[F("pamc")] = measureCurrent();
+  adjustPad(PAD_A_PWM_PIN, 0);
 
-  // Calculate max current we can draw
-  padA.on();
-  padB.on();
-  padC.on();
-  json["pad_all_max_current"] = measureCurrent();
-  padA.off();
-  padB.off();
-  padC.off();
+  adjustPad(PAD_B_PWM_PIN, 100);
+  json[F("pbmc")] = measureCurrent();
+  adjustPad(PAD_B_PWM_PIN, 0);
+
+  adjustPad(PAD_C_PWM_PIN, 100);
+  json[F("pcmc")] = measureCurrent();
+  adjustPad(PAD_C_PWM_PIN, 0);
+
+  adjustPad(PAD_A_PWM_PIN, 100);
+  adjustPad(PAD_B_PWM_PIN, 100);
+  adjustPad(PAD_C_PWM_PIN, 100);
+  delay(1000);
+  json[F("pmc")] = measureCurrent();
+  adjustPad(PAD_A_PWM_PIN, 0);
+  adjustPad(PAD_B_PWM_PIN, 0);
+  adjustPad(PAD_C_PWM_PIN, 0);
 
   sendJson(json);
 }
 
 void sendPeriodicReport() {
-  log("[i] periodic report:");
+  log(F("[i] periodic report:"));
 
   StaticJsonDocument<192> json;
 
-  json["type"] = "periodic_report";
-  json["current"] = getCurrent();
-  json["pad_a_target_temp"] = padA.getTargetTemp();
-  json["pad_a_temp"] = padA.getTemp();
-  json["pad_a_temp_a"] = padA.getRawTemp(0);
-  json["pad_a_temp_b"] = padA.getRawTemp(1);
-  json["pad_b_target_temp"] = padB.getTargetTemp();
-  json["pad_b_temp"] = padB.getTemp();
-  json["pad_b_temp_a"] = padB.getRawTemp(0);
-  json["pad_b_temp_b"] = padB.getRawTemp(1);
-  json["pad_c_target_temp"] = padC.getTargetTemp();
-  json["pad_c_temp"] = padC.getTemp();
-  json["pad_c_temp_a"] = padC.getRawTemp(0);
-  json["pad_c_temp_b"] = padC.getRawTemp(1);
+  json[F("_t")] = F("pr");
+  json[F("c")] = getCurrent();
+  json[F("pac")] = padA_Cycle;
+  json[F("pbc")] = padB_Cycle;
+  json[F("pcc")] = padC_Cycle;
   sendJson(json);
 }
 
 void processIncomingCommand() {
-  if (hasPendingBluetoothData) {
-    log("[i] command received: ");
-
-    // Cast volatile char[] type to char[]
-    char _bluetoothData[BLUETOOTH_MAX_RX_PACKET];
-    for(int i = 0; i < BLUETOOTH_MAX_RX_PACKET; i++) {
-      _bluetoothData[i] = bluetoothData[i];
-    }
-
-    hasPendingBluetoothData = false;
+  if (bluetooth.available()) {
+    log(F("[i] command received: "));
     
-    if (DEBUG) {
-      Serial.print(_bluetoothData);
-    }
+    StaticJsonDocument<64> json;
 
-    StaticJsonDocument<BLUETOOTH_MAX_RX_PACKET> json;
-    DeserializationError error = deserializeJson(json, _bluetoothData);
+    #ifdef DEBUG
+      ReadLoggingStream loggingStream(bluetooth, Serial);
+      ReadBufferingStream bufferingStream(loggingStream, 64);
+    #else
+      ReadBufferingStream bufferingStream(bluetooth, 64);
+    #endif
+
+    DeserializationError error = deserializeJson(json, bufferingStream);
     
     if (error) {
-      log("[-] error parsing json:");
+      log(F("[-] error parsing json:"));
       log(error.f_str());
-      sendSignal("command_error");
+      sendSignal(F("cmd_err"));
       return;
     }
     
-    if (json["type"] == "config") {
-      padA.setTargetTemp(json["pad_a_target_temp"]);
-      //padB.setTargetTemp(json["pad_b_target_temp"]);
-      //padC.setTargetTemp(json["pad_c_target_temp"]);
-    }
-
-    sendSignal("command_done");
+    if (json[F("_t")] == F("c")) {
+      padA_Cycle = json[F("pac")].as<int>();
+      padB_Cycle = json[F("pbc")].as<int>();
+      padC_Cycle = json[F("pcc")].as<int>();
+      sendSignal(F("cmd_ok"));
+    } else {
+      sendSignal(F("cmd_no"));
+    }    
   }
 }

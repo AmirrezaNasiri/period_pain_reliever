@@ -12,7 +12,7 @@ void log(const __FlashStringHelper* message) {
 
 void sendJson(const JsonDocument& doc) {
   if (DEBUG) {
-    log("[i] sent to bluetooth:");
+    log(F("[i] sent to bluetooth:"));
     serializeJsonPretty(doc, Serial);
     Serial.println();
   }
@@ -21,9 +21,9 @@ void sendJson(const JsonDocument& doc) {
   bluetooth.println();
 }
 
-void sendSignal(const char* type) {
-  StaticJsonDocument<48> doc;
-  doc["type"] = type;
+void sendSignal(const __FlashStringHelper* type) {
+  StaticJsonDocument<32> doc;
+  doc[F("_t")] = type;
   sendJson(doc);
 }
 
@@ -37,6 +37,11 @@ float measureCurrent() {
 }
 
 float getCurrent() {
+  delay(10);
   float value = current.mA_DC();
   return value > 0 ? value : 0;
+}
+
+void adjustPad(int pin, int value) {
+  analogWrite(pin, (int) (value * 255 / 100));
 }
